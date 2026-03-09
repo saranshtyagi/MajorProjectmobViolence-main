@@ -1,37 +1,38 @@
 import os
+import re
+import json
 import tempfile
+import base64
 
 import cv2
 import numpy as np
-import tensorflow as tf
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from groq import Groq
+from dotenv import load_dotenv
 
+# -------- Load .env -------- #
+load_dotenv()
 
-SEQ_LEN = 10       
-HEIGHT = 64
-WIDTH = 64
-THRESHOLD = 0.5       
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MODEL_PATH = os.path.join(BASE_DIR, "models", "mob_violence_model.h5")
+# -------- Config -------- #
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+NUM_FRAMES = 5
+FRAME_HEIGHT = 512
+FRAME_WIDTH = 512
+THRESHOLD = 0.5
 
-# ---------------- Load model ---------------- #
+if not GROQ_API_KEY:
+    raise ValueError("GROQ_API_KEY not found in .env file")
 
-if not os.path.exists(MODEL_PATH):
-    raise FileNotFoundError(f"Model not found at {MODEL_PATH}")
+client = Groq(api_key=GROQ_API_KEY)
 
-print("Loading model from:", MODEL_PATH)
-model = tf.keras.models.load_model(MODEL_PATH)
-print("Model loaded successfully.")
-
-# ---------------- Flask app ---------------- #
-
+# -------- Flask App -------- #
 app = Flask(__name__)
 CORS(app)
 
 
-def video_to_sequence(video_path, seq_len=SEQ_LEN, height=HEIGHT, width=WIDTH):
-    """Read video and sample seq_len frames → (1, seq_len, H, W, 3)"""
+def extract_frames(video_path, num_frames=NUM_FRAMES):
+    """Extract evenly-spaced frames from a video and return as base64 JPEG strings."""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         cap.release()
@@ -42,47 +43,133 @@ def video_to_sequence(video_path, seq_len=SEQ_LEN, height=HEIGHT, width=WIDTH):
         cap.release()
         return None
 
-    indices = np.linspace(0, total_frames - 1, seq_len, dtype=int)
-    index_set = set(indices)
-
-    frames = []
+    indices = set(np.linspace(0, total_frames - 1, num_frames, dtype=int))
+    frames_b64 = []
     idx = 0
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-
-        if idx in index_set:
-            frame = cv2.resize(frame, (width, height))
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frames.append(frame)
+        if idx in indices:
+            frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
+            _, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            frames_b64.append(base64.b64encode(buffer).decode("utf-8"))
         idx += 1
 
     cap.release()
+    return frames_b64 if frames_b64 else None
 
-    if len(frames) == 0:
-        return None
 
-    while len(frames) < seq_len:
-        frames.append(frames[-1])
+def analyze_with_groq(frames_b64):
+    """Send frames to Groq vision model and get violence analysis."""
 
-    arr = np.array(frames[:seq_len], dtype=np.float32) / 255.0
-    arr = np.expand_dims(arr, axis=0)  # (1, seq_len, H, W, 3)
-    return arr
+    content = [
+        {
+            "type": "text",
+            "text": (
+                "You are a security surveillance AI assistant. I am giving you multiple frames "
+                "extracted from a SINGLE CCTV video clip. Analyze ALL frames TOGETHER as one video "
+                "and give me ONE single consolidated assessment of the entire video.\n\n"
+                "DO NOT analyze each frame separately. Look at all frames as a sequence from one video.\n\n"
+                "You MUST respond with EXACTLY ONE JSON object in this format, nothing else:\n"
+                '{"label": "violent" or "non-violent", "probability": <float between 0.0 and 1.0>, '
+                '"reason": "<brief one-line explanation>"}\n\n'
+                "Rules:\n"
+                "- probability should reflect your confidence (0.0 = definitely safe, 1.0 = definitely violent)\n"
+                "- Look for punching, kicking, throwing objects, stampede, aggressive mobs.\n"
+                "- Normal crowd gatherings, walking, standing are NOT violent.\n"
+                "- Respond with ONLY ONE raw JSON object. No multiple objects. No markdown. No extra text."
+            ),
+        }
+    ]
 
+    for i, b64 in enumerate(frames_b64):
+        content.append({
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:image/jpeg;base64,{b64}",
+            },
+        })
+
+    response = client.chat.completions.create(
+        model="meta-llama/llama-4-scout-17b-16e-instruct",
+        messages=[
+            {
+                "role": "user",
+                "content": content,
+            }
+        ],
+        temperature=0.1,
+        max_completion_tokens=256,
+    )
+
+    return response.choices[0].message.content
+
+
+def parse_groq_response(raw_response):
+    """
+    Parse the Groq response. Handles two cases:
+    1. Single JSON object (expected) — parse directly
+    2. Multiple JSON objects (one per frame) — parse each, average results
+    """
+    cleaned = raw_response.strip()
+
+    # Strip markdown code fences if present
+    if cleaned.startswith("```"):
+        cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+
+    # Try parsing as a single JSON object first
+    try:
+        result = json.loads(cleaned)
+        return result
+    except json.JSONDecodeError:
+        pass
+
+    # Fallback: Multiple JSON objects (one per line or concatenated)
+    parts = re.split(r'\}\s*\n\s*\{', cleaned)
+
+    results = []
+    for i, part in enumerate(parts):
+        if not part.strip().startswith("{"):
+            part = "{" + part
+        if not part.strip().endswith("}"):
+            part = part + "}"
+        try:
+            results.append(json.loads(part))
+        except json.JSONDecodeError:
+            continue
+
+    if not results:
+        raise ValueError(f"Could not parse Groq response: {raw_response}")
+
+    # Average all results into one
+    avg_prob = sum(r.get("probability", 0.0) for r in results) / len(results)
+
+    # Count violent vs non-violent labels (majority vote)
+    violent_count = sum(1 for r in results if r.get("label", "").lower() == "violent")
+    label = "violent" if violent_count > len(results) / 2 else "non-violent"
+
+    # Combine reasons
+    reasons = [r.get("reason", "") for r in results if r.get("reason")]
+    combined_reason = reasons[0] if len(reasons) == 1 else f"Based on {len(results)} frames: {reasons[0]}"
+
+    return {
+        "label": label,
+        "probability": round(avg_prob, 4),
+        "reason": combined_reason,
+    }
+
+
+# -------- Routes -------- #
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok", "backend": "groq-vision"})
 
 
 @app.route("/predict_clip", methods=["POST"])
 def predict_clip():
-    """
-    Expects: multipart/form-data with field "video"
-    Returns: { "probability": float (violence prob), "label": "violent" | "non-violent" }
-    """
     if "video" not in request.files:
         return jsonify({"error": "No 'video' file in request"}), 400
 
@@ -90,35 +177,43 @@ def predict_clip():
     if file.filename == "":
         return jsonify({"error": "Empty filename"}), 400
 
-    # Save uploaded video to a temp file
     fd, tmp_path = tempfile.mkstemp(suffix=".mp4")
     os.close(fd)
     file.save(tmp_path)
 
     try:
-        seq = video_to_sequence(tmp_path)
-        if seq is None:
+        frames = extract_frames(tmp_path)
+        if frames is None:
             return jsonify({"error": "Could not read video frames"}), 400
 
-        # Softmax model output: [non_violent_prob, violent_prob]
-        pred = model.predict(seq, verbose=0)[0]
-        prob_non_violent = float(pred[0])
-        prob_violent = float(pred[1])
+        print(f"Extracted {len(frames)} frames, sending to Groq...")
 
-        prob = prob_violent
-        label = "violent" if prob_violent >= THRESHOLD else "non-violent"
+        raw_response = analyze_with_groq(frames)
+        print("Groq response:", raw_response)
+
+        # Parse with fallback handling
+        result = parse_groq_response(raw_response)
+
+        prob = float(result.get("probability", 0.0))
+        label = result.get("label", "non-violent").lower()
+        reason = result.get("reason", "")
+
+        if label not in ("violent", "non-violent"):
+            label = "violent" if prob >= THRESHOLD else "non-violent"
 
         return jsonify({
             "probability": prob,
             "label": label,
+            "reason": reason,
             "raw_probs": {
-                "non_violent": prob_non_violent,
-                "violent": prob_violent
-            }
+                "non_violent": round(1 - prob, 4),
+                "violent": round(prob, 4),
+            },
         })
+
     except Exception as e:
-        print("Error during prediction:", e)
-        return jsonify({"error": "Internal server error"}), 500
+        print("Error:", e)
+        return jsonify({"error": str(e)}), 500
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
