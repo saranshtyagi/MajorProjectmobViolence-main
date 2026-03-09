@@ -18,7 +18,7 @@
                 <span>Mob Violence Detection</span>
             </div>
             <div class="navbar-right">
-                <span class="tag">Deep Learning · CCTV</span>
+                <span class="tag">Deep Learning · CCTV · Groq AI</span>
             </div>
         </header>
 
@@ -31,10 +31,18 @@
                     <span class="status-pill" id="systemStatus">Idle</span>
                 </div>
                 <div class="video-wrapper">
-                    <!-- Placeholder for now; later you can plug an MJPEG/RTSP stream -->
-                    <div class="video-placeholder">
-                        <span>Live feed preview</span>
-                        <small>Connect this to /video_feed or a stream later</small>
+                    <!-- Live MJPEG stream from backend -->
+                    <img
+                        id="liveStream"
+                        class="live-stream"
+                        src=""
+                        alt="Live feed will appear here"
+                        style="width:100%; height:100%; object-fit:cover; display:none; border-radius:8px;"
+                    />
+                    <!-- Placeholder shown when no feed is active -->
+                    <div class="video-placeholder" id="videoPlaceholder">
+                        <span>No feed active</span>
+                        <small>Start Webcam or load a Simulation video below</small>
                     </div>
 
                     <!-- Overlay badge -->
@@ -47,12 +55,20 @@
                 <div class="panel-footer">
                     <div class="info-label">
                         <span class="label-title">Threshold</span>
-                        <span class="label-value" id="thresholdValue">0.60</span>
+                        <span class="label-value" id="thresholdValue">0.50</span>
                     </div>
                     <div class="info-label">
                         <span class="label-title">Last prediction</span>
                         <span class="label-value" id="lastPredictionTime">—</span>
                     </div>
+                </div>
+
+                <!-- Live Feed Controls -->
+                <div class="feed-controls">
+                    <button id="startWebcamBtn" class="btn-primary">📷 Start Webcam</button>
+                    <button id="startSimBtn" class="btn-secondary">🎬 Simulate CCTV</button>
+                    <input type="file" id="simVideoInput" accept="video/*" hidden />
+                    <button id="stopFeedBtn" class="btn-danger" disabled>⏹ Stop Feed</button>
                 </div>
             </section>
 
@@ -86,6 +102,10 @@
                         <div class="result-row">
                             <span class="result-label">Probability</span>
                             <span class="result-value" id="resultProb">—</span>
+                        </div>
+                        <div class="result-row">
+                            <span class="result-label">Reason</span>
+                            <span class="result-value" id="resultReason">—</span>
                         </div>
                     </div>
                 </section>
