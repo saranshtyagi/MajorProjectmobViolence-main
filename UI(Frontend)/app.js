@@ -134,9 +134,16 @@ analyzeBtn.addEventListener("click", async () => {
         const label = data.label;
 
         // Update result card
+                // Update result card
         resultCard.hidden = false;
         resultLabel.textContent = label === "violent" ? "Violent" : "Non-violent";
         resultProb.textContent = prob.toFixed(3);
+
+        // Show reason if available
+        const reasonElem = document.getElementById("resultReason");
+        if (reasonElem && data.reason) {
+            reasonElem.textContent = data.reason;
+        }
 
         // Update live status and logs
         updateLiveStatus(label, prob);
